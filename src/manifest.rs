@@ -7,7 +7,7 @@ use crate::Descriptor;
 use crate::descriptor::GitVersion;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct EggTopDecl {
+struct TopDecl {
     /// Name of the package, for example "CoolCollections".
     name: String,
 
@@ -16,18 +16,18 @@ struct EggTopDecl {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct EggDependency {
+struct Dep {
     /// Url to git repository, for example `https://github.com/Kiiyya/CoolCollections`.
     git: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct EggManifest {
+struct RawManifest {
     #[serde(rename = "egg")]
-    topdecl: EggTopDecl,
+    topdecl: TopDecl,
 
     /// Package name --> (where to find it, version, etc...).
-    dependencies: BTreeMap<String, EggDependency>,
+    dependencies: BTreeMap<String, Dep>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,7 +41,7 @@ pub struct Manifest {
 impl Manifest {
     // ugly, but for now...
     pub fn from_string(s: impl AsRef<str>) -> Result<Manifest, anyhow::Error> {
-        let egg: EggManifest = toml::from_str(s.as_ref())?;
+        let egg: RawManifest = toml::from_str(s.as_ref())?;
         let manifest = Self {
             name: egg.topdecl.name,
             version: egg.topdecl.version,

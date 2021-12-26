@@ -1,190 +1,134 @@
 #![feature(exit_status_error)]
 #![feature(map_try_insert)]
+#![feature(arc_new_cyclic)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{fs::create_dir_all, io::ErrorKind, path::Path};
 
+use anyhow::Context;
 use descriptor::Descriptor;
-use futures::future::{join_all, join, try_join, try_join_all};
-use itertools::Itertools;
+use error::{ManifestFetchError, SourceFetchError, BuildTtcError};
+use futures::future::join;
 use lazy::Lazy;
 use maplit::btreemap;
+use node::Node;
 use structopt::StructOpt;
+use tracing::simple::SimpleTracer;
+use tracing::{Tracer, SourceProgress, BuildProgress, ManifestProgress, SourceProgressMethod};
 
-use crate::egg::Manifest;
+use crate::manifest::Manifest;
+use crate::paths::Idris2Paths;
 
-pub mod egg;
+pub mod manifest;
 pub mod lazy;
 pub mod descriptor;
-
-
-/// A node in the dependency tree. Uses interior mutability, so is clone-able.
-#[derive(Debug, Clone)]
-pub struct Node {
-    pub manifest: Arc<Lazy<Result<Manifest, ManifestFetchError>>>,
-
-    /// Base path, so that `{source_path}/Egg.toml`.
-    pub source_path: Arc<Lazy<Result<PathBuf, SourceFetchError>>>,
-
-    /// Compiled TTC files done? If yes, they can be found here (usually `{source_path}/build/ttc`).
-    pub ttc: Arc<Lazy<Result<PathBuf, BuildTtcError>>>,
-}
-
-impl Node {
-    pub fn new(
-        manifest: Lazy<Result<Manifest, ManifestFetchError>>,
-        source_path: Lazy<Result<PathBuf, SourceFetchError>>,
-        ttc: Lazy<Result<PathBuf, BuildTtcError>>,
-    ) -> Self {
-        Self {
-            manifest: Arc::new(manifest),
-            source_path: Arc::new(source_path),
-            ttc: Arc::new(ttc),
-        }
-    }
-
-    pub fn new_partial(
-        manifest: Manifest,
-        source_path: impl AsRef<Path>,
-        ttc: Lazy<Result<PathBuf, BuildTtcError>>,
-    ) -> Self {
-        Self {
-            manifest: Arc::new(Lazy::new_immediate(Ok(manifest))),
-            source_path: Arc::new(Lazy::new_immediate(Ok(source_path.as_ref().to_owned()))),
-            ttc: Arc::new(ttc),
-        }
-    }
-
-    pub fn new_full(
-        manifest: Manifest,
-        source_path: impl AsRef<Path>,
-        ttc: impl AsRef<Path>,
-    ) -> Self {
-        Self {
-            manifest: Arc::new(Lazy::new_immediate(Ok(manifest))),
-            source_path: Arc::new(Lazy::new_immediate(Ok(source_path.as_ref().to_owned()))),
-            ttc: Arc::new(Lazy::new_immediate(Ok(ttc.as_ref().to_owned()))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SourceFetchError {
-    #[error("Dummy")]
-    Dummy(Arc<anyhow::Error>),
-
-    #[error("Dummy")]
-    GitError(Arc<git2::Error>),
-}
-
-impl From<git2::Error> for SourceFetchError {
-    fn from(err: git2::Error) -> Self {
-        Self::GitError(Arc::new(err))
-    }
-}
-
-impl From<anyhow::Error> for SourceFetchError {
-    fn from(e: anyhow::Error) -> Self {
-        Self::Dummy(Arc::new(e))
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum BuildTtcError {
-    #[error("Dummy")]
-    Dummy(Arc<anyhow::Error>),
-
-    #[error("Failed to fetch source: {0}")]
-    SourceFetch(#[from] SourceFetchError),
-
-    #[error("Failed to fetch manifest: {0}")]
-    ManifestFetch(#[from] ManifestFetchError),
-}
-
-impl From<anyhow::Error> for BuildTtcError {
-    fn from(e: anyhow::Error) -> Self {
-        Self::Dummy(Arc::new(e))
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum ManifestFetchError {
-    #[error("Dummy")]
-    Dummy(Arc<anyhow::Error>),
-
-    #[error("Failed to fetch source: {0}")]
-    SourceFetch(#[from] SourceFetchError),
-
-    #[error("File IO error: {0}")]
-    Io(Arc<std::io::Error>),
-}
-
-impl From<anyhow::Error> for ManifestFetchError {
-    fn from(e: anyhow::Error) -> Self {
-        Self::Dummy(Arc::new(e))
-    }
-}
-
-
-impl From<std::io::Error> for ManifestFetchError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(Arc::new(e))
-    }
-}
-
+pub mod error;
+pub mod node;
+pub mod paths;
+pub mod tracing;
 
 #[derive(Debug)]
-struct LairInner {
+struct LairInner<Tr: Tracer = ()> {
     /// Flat collection of package descriptors associated with their data.
-    db: std::sync::Mutex<BTreeMap<Descriptor, Node>>,
+    db: std::sync::Mutex<BTreeMap<Descriptor, Arc<Node<Tr>>>>,
+
+    /// The root node, i.e. our root package.
+    root: Arc<Node<Tr>>,
+
+    tracer: Tr,
 }
 
 #[derive(Debug, Clone)]
-pub struct Lair {
-    inner: Arc<LairInner>,
+pub struct Lair<Tr: Tracer = ()> {
+    inner: Arc<LairInner<Tr>>,
 }
 
-impl Lair {
-    pub fn new(root_manifest: Manifest, root_path: impl AsRef<Path>) -> (Self, Descriptor) {
-        let myself = Self {
-            inner: Arc::new(LairInner {
-                db: std::sync::Mutex::new(BTreeMap::new()),
-                // db: std::sync::Mutex::new(btreemap!{
-                //     root_descriptor => root_node
-                // }),
-            })
-        };
+impl<Tr: Tracer> Lair<Tr> {
+    /// Does not start anything yet, only initializes the root node with recipes.
+    ///
+    /// You can then try getting the TTC files for the root node, which will trigger the
+    /// recipes stored inside the root node, which in turn will trigger fetching its dependencies'
+    /// manifests, sources, TTCs, and so forth recursively.
+    pub fn new(root_manifest: Manifest, root_path: impl AsRef<Path>) -> Self
+        where Tr: Default
+    {
         let root_descriptor = Descriptor::Root { name: root_manifest.name.clone() };
-
-        let myself_clone = myself.clone();
         let root_descriptor_clone = root_descriptor.clone();
+        let root_descriptor_clone2 = root_descriptor.clone();
 
-        let root_node = Node::new_partial(
-            root_manifest,
-            root_path.as_ref(),
-            Lazy::new(async move { myself_clone.build_ttc(root_descriptor_clone).await } ),
-        );
-        let mut db = myself.inner.db.lock().unwrap();
-        db.insert(root_descriptor.clone(), root_node);
-        drop(db);
+        let inner: Arc<LairInner<Tr>> = Arc::new_cyclic(move |weak| {
+            let weak = weak.clone();
+            let root_node = Arc::new(Node::new_partial(
+                weak.clone(),
+                root_descriptor.clone(),
+                root_manifest,
+                root_path.as_ref(),
+                Lazy::new(async move {
+                    let inner: Arc<LairInner<Tr>> = weak.upgrade().context("Failed to upgrade weak Arc.")?;
+                    inner.build_ttc(root_descriptor_clone).await
+                }),
+            ));
 
-        (myself, root_descriptor)
+            LairInner {
+                db: Mutex::new(btreemap! {
+                    root_descriptor => root_node.clone(),
+                }),
+                root: root_node,
+                tracer: Tr::default(),
+            }
+        });
+
+        inner.tracer.new_descriptor(&root_descriptor_clone2);
+        Self { inner }
+    }
+
+    /// Get the root node.
+    pub fn root(&self) -> &Node<Tr> {
+        &self.inner.root
     }
 
     /// Gets a node, or creates the node, which contains recipes on how to fetch or build
     /// the sources, TTC, manifest.
-    pub fn get(&self, desc: Descriptor) -> Node {
-        let mut db = self.inner.db.lock().unwrap();
+    ///
+    /// We return a [`Node`], which uses [`Arc`] (reference counting) internally.
+    /// We don't return `&Node`, since that would violate our internal Mutex.
+    pub fn node(&self, desc: &Descriptor) -> Arc<Node<Tr>> {
+        self.inner.node(desc)
+    }
 
-        if let Some(node) = db.get(&desc) {
+    pub async fn build(&self) -> Result<(), anyhow::Error> {
+        let build_deps_dir = PathBuf::from("build").join("deps");
+        create_dir_all(build_deps_dir)?; // ./build/deps
+
+        self.root().ttc().await?;
+
+        Ok(())
+    }
+
+    pub async fn run(&self) -> Result<(), anyhow::Error> {
+        let deps_ttc_paths = self.root().dependencies_ttc_paths().await?; // will complete instantly, because we've already built everything.
+
+        Command::new("idris2")
+            .env("IDRIS2_PATH", deps_ttc_paths.join_idris2())
+            .arg("--source-dir").arg("src")
+            .arg(self.root().main().await?)
+            .arg("--exec").arg("main")
+            .status().unwrap().exit_ok().unwrap(); // TODO: fix both unwraps here, check for errors idris returned.
+
+        Ok(())
+    }
+}
+
+impl<Tr: Tracer> LairInner<Tr> {
+    pub fn node(self: &Arc<Self>, desc: &Descriptor) -> Arc<Node<Tr>> {
+        let mut db = self.db.lock().unwrap();
+
+        if let Some(node) = db.get(desc) {
             node.clone()
         } else {
-            let self_clone1: Lair = self.clone();
-            let self_clone2: Lair = self.clone();
-            let self_clone3: Lair = self.clone();
             let desc_clone1: Descriptor = desc.clone();
             let desc_clone2: Descriptor = desc.clone();
             let desc_clone3: Descriptor = desc.clone();
@@ -192,131 +136,144 @@ impl Lair {
             // Create a new node, with recipes on how to obtain its source/ttcs, which will be
             // invoked when necessary.
             // This only creates futures, which may or may not be invoked in the future (harr harr).
-            let node = Node::new(
-                Lazy::new(async move { self_clone1.fetch_manifest(desc_clone1).await }),
-                Lazy::new(async move { self_clone2.fetch_source(desc_clone2).await }),
-                Lazy::new(async move { self_clone3.build_ttc(desc_clone3).await } ),
-            );
+            let node = Arc::new(Node::new(
+                Arc::downgrade(self),
+                desc.clone(),
+                Lazy::new_weak(self, move |lair| async move { lair.fetch_manifest(desc_clone1).await }),
+                Lazy::new_weak(self, move |lair| async move { lair.fetch_source(desc_clone2).await }),
+                Lazy::new_weak(self, move |lair| async move { lair.build_ttc(desc_clone3).await }),
+            ));
+
+            self.tracer.new_descriptor(desc);
+
             db.insert(desc.clone(), node.clone());
             node
         }
     }
 
-    async fn build_ttc(&self, desc: Descriptor) -> Result<PathBuf, BuildTtcError> {
-        println!("{} [TTC] Starting...", desc.name());
-        let node = self.get(desc.clone());
-        let manifest = node.manifest.get().await?;
+    /// Recipe for building TTC files.
+    async fn build_ttc(self: &Arc<Self>, desc: Descriptor) -> Result<PathBuf, BuildTtcError> {
+        let node = self.node(&desc);
 
         // Build dependencies in parallel (and recurse, kind of). Then unpack results, making sure
         // they all built correctly, and collect into an IDRIS2_PATH.
+        let (base_path, deps_paths) = join(node.base_path(), node.dependencies_ttc_paths()).await;
+        let deps_paths = deps_paths?;
+        let base_path = base_path?;
 
-        let futures = manifest.dependencies
-            .iter()
-            .cloned()
-            .map(|d| async move {
-                self.get(d).ttc.clone().get().await
-            });
-        let (source_path, results): (Result<PathBuf, SourceFetchError>, Vec<Result<PathBuf, BuildTtcError>>)
-            = join(node.source_path.get(), join_all(futures)).await;
+        let guard = self.tracer.building(&desc);
+        let build_dir = base_path.join("build"); // `{base_path}/build`
+        let source_dir = base_path.join("src"); // `{base_path}/src`
+        let main_idr = node.main().await?; // `{base_path}/src/AmazingTool.idr`
+        let idris2_path = deps_paths.join_idris2();
 
-        let source_path = source_path?;
-        let ttc_paths: Result<Vec<PathBuf>, _> = results.iter().cloned().collect(); // unwrap all Result<,>s.
-        let ttc_paths = ttc_paths?;
+        // println!("{} [TTC] Running command: `idris2 --build-dir {} --source-dir {} --check {}` with IDRIS2_PATH=\"{}\"",
+        //     desc.name(), build_dir.to_string_lossy(), source_dir.to_string_lossy(), main_idr.to_string_lossy(), idris2_path);
 
-        let idris2_path = ttc_paths.iter().map(|p| p.to_string_lossy()).join(":");
         Command::new("idris2")
-            .current_dir(&source_path)
-            .arg("--source-dir").arg("src")
+            .arg("--build-dir").arg(build_dir)
+            .arg("--source-dir").arg(source_dir)
             .arg("--check")
             .env("IDRIS2_PATH", &idris2_path)
-            .arg(format!("src/{}.idr", desc.name()))
-            .status().unwrap().exit_ok().unwrap(); // TODO: fix both unwraps here.
+            .arg(main_idr)
+            .status().unwrap().exit_ok().unwrap(); // TODO: fix both unwraps here, check for errors idris returned.
 
-        println!("{} [TTC] Done (IDRIS2_PATH was \"{}\")", desc.name(), idris2_path);
-
-        let mut ttc_path = source_path;
-        ttc_path.push("build");
-        ttc_path.push("ttc");
-        Ok(ttc_path)
+        let ttc = base_path.join("build").join("ttc"); // `{base_path}/build/ttc`
+        guard.success(&ttc);
+        Ok(ttc)
     }
 
+    /// Recipe for fetching source.
+    ///
     /// Returns path to source code, so that `{return value}/Egg.toml` exists.
-    async fn fetch_source(&self, desc: Descriptor) -> Result<PathBuf, SourceFetchError> {
-        println!("{} [SRC] Starting...", desc.name());
+    async fn fetch_source(self: &Arc<Self>, desc: Descriptor) -> Result<PathBuf, SourceFetchError> {
+
         match desc.clone() {
             Descriptor::Root { .. } => {
                 unreachable!("There must only be one root node, and it must be initialized with a path (usually `./`) at startup.")
             },
-            Descriptor::Git { name, url, version } => {
+            Descriptor::Git { name, url, .. } => {
                 let path = PathBuf::from(format!("build/deps/{}", name)); // TODO: make sure directory doesn't exist yet.
-                let path_clone = path.clone();
 
-                let _repo = tokio::task::spawn_blocking(move || {
-                    git2::Repository::clone(&url, &path_clone)
-                }).await.unwrap()?;
+                if path.exists() {
+                    let guard =self.tracer
+                        .fetching_repo(&desc, SourceProgressMethod::AlreadyDownloaded);
+                    guard.success(&path);
+                    Ok(path)
+                } else {
+                    let guard = self.tracer.fetching_repo(&desc,
+                        SourceProgressMethod::Git { url: &url} );
+                    let path_clone = path.clone();
+                    let _repo = tokio::task::spawn_blocking(move || {
+                        // TODO: proper error handling.
+                        git2::Repository::clone(&url, &path_clone)
+                    }).await.unwrap()?;
 
-                println!("{} [SRC] Done, git-cloned {} into {:?}.", desc.name(), name, path);
-                Ok(path)
+                    guard.success(&path);
+                    Ok(path)
+                }
             },
-            Descriptor::Local { name, path } => todo!(),
+            Descriptor::Local { .. } => todo!(),
         }
     }
 
-    async fn fetch_manifest(&self, desc: Descriptor) -> Result<Manifest, ManifestFetchError> {
-        println!("{} [MAN] Starting...", desc.name());
-        let node = self.get(desc.clone());
-        let mut path = node.source_path.get().await?;
-        path.push("Egg.toml");
+    /// Recipe for fetching manifest.
+    async fn fetch_manifest(self: &Arc<Self>, desc: Descriptor) -> Result<Manifest, ManifestFetchError> {
+        let guard = self.tracer.fetching_manifest(&desc);
 
-        let ret = egg::Manifest::from_string(std::fs::read_to_string(path)?)?;
-        println!("{} [MAN] Done.", desc.name());
+        let node = self.node(&desc);
+        let path = node.base_path().await?.join("Egg.toml");
+
+        let ret = manifest::Manifest::from_string(std::fs::read_to_string(path)?)?;
+        guard.success(&ret);
         Ok(ret)
     }
+
 }
 
 /// Ensure a directory and sub-dirs are gone.
 /// Do not fail when it's not there in the first place.
-fn clean(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+fn clean(path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Command-line thingie.
 #[derive(Debug, StructOpt)]
-#[structopt(about = "Derp")]
+#[structopt(about = "Package manager for Idris2.")]
 enum Opt {
     Build,
     Clean,
+    Run,
 }
 
 async fn real_main() -> anyhow::Result<()> {
-    std::env::set_current_dir("/mnt/e/hax/2021/NotJson")?;
-
+    // Read in command line options
     let opt: Opt = Opt::from_args();
 
-    let egg: Manifest = egg::Manifest::from_string(std::fs::read_to_string("Egg.toml")?)?;
+    let manifest: Manifest = manifest::Manifest::from_string(std::fs::read_to_string("Egg.toml")?)?;
 
     match opt {
         Opt::Build => {
-            create_dir_all("build/deps")?;
+            let lair = Lair::<SimpleTracer>::new(manifest, "");
+            lair.build().await?;
 
-            let (lair, root) = Lair::new(egg, "./");
-            let root = lair.get(root);
-            let ttc_path = root.ttc.get().await?;
-            println!("Done! TTCs are in {}", ttc_path.to_string_lossy());
+            Ok(())
+        },
+        Opt::Run => {
+            let lair = Lair::<SimpleTracer>::new(manifest, "");
+            lair.build().await?;
+            lair.run().await?;
 
-            // this will recursively build everything.
-            // let ttcs = root.ttc.get().await?;
+            Ok(())
         },
         Opt::Clean => {
-            clean("build")?;
+            clean("build")
         },
     }
-
-    Ok(())
 }
 
 #[tokio::main]

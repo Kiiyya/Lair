@@ -16,48 +16,57 @@
 //! whateevr) until it is done downloading.
 
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use either::Either;
 use futures::Future;
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 
+/// See the module-level docs.
 pub struct Lazy<T> {
-	inner: Mutex<
-		Either<
-			T,
-			BoxFuture<'static, T>
-		>
-	>,
+	inner: Mutex<Either<
+		T,
+		BoxFuture<'static, T>
+	>>,
 }
 
 impl<T: Debug> Debug for Lazy<T> {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		todo!()
-		// let mut ds = f.debug_struct("Lazy");
-		// match self.inner.try_lock() {
-		// 	Ok(inner) => {
-		// 		match &*inner {
-		// 			Either::Left(val) => {ds.field("inner", val.fmt(f)?);},
-		// 			Either::Right(_) => {ds.field("inner", "<unresolved>");},
-		// 		}
-		// 	},
-		// 	Err(_) => {
-		// 		ds.field("inner", &"<mutex locked>");
-		// 	},
-		// }
-        // // f.debug_struct("Lazy").field("inner", &self.inner).finish()
-		// ds.finish()
     }
 }
 
 impl<T> Lazy<T> {
-	pub fn new<F>(f: F) -> Self
+	pub fn new<F>(recipe: F) -> Self
 	where
 		F: Future<Output = T> + Send + 'static,
 	{
 		Self {
-			inner: Mutex::new(Either::Right(Box::pin(f))),
+			inner: Mutex::new(Either::Right(Box::pin(recipe))),
+		}
+	}
+
+	/// Creates a new Lazy which takes an `Arc<S>` when called.
+	/// But stores the `arc` as a `Weak<S>` until it is called.
+	/// This function is useful to prevent reference counting cycles.
+	///
+	/// For now, panics when the Arc-upgrade fails, will maybe change some time in the
+	/// future.
+	pub fn new_weak<S, Fut, F>(arc: &Arc<S>, recipe: F) -> Self
+	where
+		S: Send + Sync + 'static,
+		Fut: Future<Output = T> + Send + 'static,
+		F: (FnOnce(Arc<S>) -> Fut) + Send + 'static,
+	{
+		let weak = Arc::downgrade(arc);
+		let fut = async move {
+			let arc = weak.upgrade().expect("Failed to upgrade weak Arc.");
+			recipe(arc).await
+		};
+
+		Self {
+			inner: Mutex::new(Either::Right(Box::pin(fut))),
 		}
 	}
 
@@ -91,10 +100,10 @@ impl<T> Lazy<T> {
 	// }
 }
 
-pub enum Progress {
-	NotStarted,
-	Working,
-	Done,
-}
+// pub enum Progress {
+// 	NotStarted,
+// 	Working,
+// 	Done,
+// }
 
 

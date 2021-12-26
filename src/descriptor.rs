@@ -14,7 +14,7 @@ pub enum GitVersion {
 }
 
 /// *Dependency descriptor*: package name together with version. Enough to info to find and download
-/// the source code.
+/// the source code. This is just POD.
 ///
 /// This should determine the exact source code
 /// Ideally (loc1 == loc2 ==> hash(loc1.download()) == hash(loc2.download())), assuming same point
