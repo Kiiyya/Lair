@@ -23,8 +23,7 @@ struct Dep {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RawManifest {
-    #[serde(rename = "egg")]
-    topdecl: TopDecl,
+    package: TopDecl,
 
     /// Package name --> (where to find it, version, etc...).
     dependencies: BTreeMap<String, Dep>,
@@ -43,8 +42,8 @@ impl Manifest {
     pub fn from_string(s: impl AsRef<str>) -> Result<Manifest, anyhow::Error> {
         let egg: RawManifest = toml::from_str(s.as_ref())?;
         let manifest = Self {
-            name: egg.topdecl.name,
-            version: egg.topdecl.version,
+            name: egg.package.name,
+            version: egg.package.version,
             dependencies: egg.dependencies.iter().map(|(name, dep)|
                 Descriptor::Git {
                     name: name.to_owned(),
