@@ -54,11 +54,11 @@ Have a look at [CoolCollections](https://github.com/Kiiyya/CoolCollections).
 In short:
 ```
 CoolCollections/ -- Repo root
-	Egg.toml -- The manifest
-	src/
-		CoolCollections.idr -- Main file, `CoolCollections` idris2 module.
-		CoolCollections/
-			SimpleMap.idr -- `CoolCollections.SimpleMap` idris2 module.
+    Egg.toml -- The manifest
+    src/
+        CoolCollections.idr -- Main file, `CoolCollections` idris2 module.
+        CoolCollections/
+            SimpleMap.idr -- `CoolCollections.SimpleMap` idris2 module.
 ```
 Also this
 [discussion](https://discord.com/channels/827106007712661524/841274390481600562/921754399334875156)

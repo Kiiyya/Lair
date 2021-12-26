@@ -68,16 +68,16 @@ impl<Tr: Tracer> Node<Tr> {
         self.lair.upgrade().expect("Failed to upgrade lair weak Arc.")
     }
 
-	/// Package name, for example `AmazingTool`.
+    /// Package name, for example `AmazingTool`.
     pub fn name(&self) -> &str {
         self.descriptor.name()
     }
 
-	/// If the package name is `AmazingTool`, then this will usually be
-	/// `{base_path}/src/AmazingTool.idr`.
-	pub async fn main(&self) -> Result<PathBuf, SourceFetchError> {
-		Ok(self.base_path().await?.join("src").join(format!("{}.idr", self.name())))
-	}
+    /// If the package name is `AmazingTool`, then this will usually be
+    /// `{base_path}/src/AmazingTool.idr`.
+    pub async fn main(&self) -> Result<PathBuf, SourceFetchError> {
+        Ok(self.base_path().await?.join("src").join(format!("{}.idr", self.name())))
+    }
 
     pub async fn manifest(&self) -> Result<Manifest, ManifestFetchError> {
         self.manifest.get().await
@@ -89,7 +89,7 @@ impl<Tr: Tracer> Node<Tr> {
         self.base_path.get().await
     }
 
-	/// TTC path, usually `{base_path}/build/ttc`.
+    /// TTC path, usually `{base_path}/build/ttc`.
     pub async fn ttc(&self) -> Result<PathBuf, BuildTtcError> {
         self.ttc.get().await
     }
